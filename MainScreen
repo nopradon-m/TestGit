@@ -1,0 +1,762 @@
+Screens:
+  Main Screen:
+    Properties:
+      LoadingSpinnerColor: =RGBA(56, 96, 178, 1)
+      OnVisible: "=// --- ส่วนที่ 1: เริ่มต้นการทำงาน ---\r\n// แสดง Loading Spinner และรีเฟรชข้อมูลล่าสุดจากแหล่งข้อมูล\r\nUpdateContext({ var_showLoader: true });\r\nRefresh(SNP_LoadExportSalesOrders);\r\nRefresh(SNP_ItemMasters);\r\nRefresh(SNP_SerialNumbers);\r\n\r\nSet(varCurrentTimeVal, Hour(Now()) + Minute(Now())/60);\r\nSet(varActiveRound,If(varCurrentTimeVal > 10.5 && varCurrentTimeVal <= 16.0, \"Afternoon\", \"Morning\"));\r\n\r\n// --- ส่วนที่ 2: ดึงข้อมูลสิทธิ์ของผู้ใช้งาน (User Permissions) ---\r\n// 2.1 ดึงรายการ Priority (โซนที่รับผิดชอบ) ของ User ที่กำลัง Login\r\nClearCollect(\r\n    colMyPrio,\r\n    Filter(\r\n        TH_WH_Priorities, \r\n        uzp_user.'Primary Email' = Office365Users.MyProfile().Mail\r\n    )\r\n);\r\n\r\n// 2.2 ดึงเฉพาะ ID ของ Zone ที่มีสิทธิ์ เก็บไว้เพื่อตรวจสอบภายหลัง (ช่วยให้ทำงานเร็วขึ้น)\r\nClearCollect(\r\n    colMyZoneLookups, \r\n    ForAll(\r\n        colMyPrio,\r\n        {\r\n            Value: uzp_zone.TH_WH_Zone \r\n        }\r\n    )\r\n);\r\n\r\n// --- ส่วนที่ 3: ดึงข้อมูลอ้างอิง (Reference Data) ---\r\n// ดึงข้อมูลลำดับความสำคัญของเส้นทาง (Route Priority)\r\nClearCollect(\r\n    colRouteRef, \r\n    whDestinationCode\r\n);\r\n\r\n// --- ส่วนที่ 4: ดึงและคัดกรองข้อมูลงาน (Data Fetching & Cleaning) ---\r\n// 4.1 ดึงรายการงานดิบ (Raw Data) ตามเงื่อนไขบริษัท, สถานะ, และวันที่กำหนด\r\nClearCollect(\r\n    colBaseItems,\r\n    Filter(\r\n        SNP_LoadExportSalesOrders,\r\n        Company = companyText.Text && \r\n        Scanned = 0 &&\r\n        DeliveryDate >= Today() &&\r\n        DeliveryDate <= DateAdd(Today(), 15, TimeUnit.Days) &&\r\n        (IsBlank(selectedLoad) || selectedLoad = 0) \r\n        //&&round = varActiveRound\r\n    )\r\n);\r\n\r\n// 4.2 ตรวจสอบคุณภาพข้อมูล (Data Validation)\r\n// หาเลข Load ที่ \"ข้อมูลไม่ครบ\" (ไม่มี Location) เพื่อทำเป็น Blacklist\r\nClearCollect(\r\n    colInvalidLoads,\r\n    Distinct(\r\n        Filter(\r\n            colBaseItems, \r\n            IsBlank(crcfe_locationid) || crcfe_locationid = \"\" \r\n        ), \r\n        cr519_loadexportno\r\n    )\r\n);\r\n\r\n// 4.3 กรองข้อมูลจริง\r\n// ตัดเลข Load ที่อยู่ใน Blacklist ทิ้งไปทั้งใบ (ป้องกัน User เลือกงานที่ทำไม่ได้)\r\nClearCollect(\r\n    colBaseItems,\r\n    Filter(\r\n        colBaseItems,\r\n        !(cr519_loadexportno in colInvalidLoads.Value)\r\n    )\r\n);\r\n\r\n// --- ส่วนที่ 5: เตรียมข้อมูล Location (Performance Optimization) ---\r\n// 5.1 ดึงรายชื่อ Location ที่ไม่ซ้ำกันออกจากรายการงาน\r\nClearCollect(\r\n    colUniqueLocationNames,\r\n    Distinct(colBaseItems, crcfe_locationid)\r\n);\r\n\r\n// 5.2 ดึงข้อมูลรายละเอียด Location จาก Dataverse ในครั้งเดียว (ลดการเรียก API)\r\nClearCollect(\r\n    colLocationsData,\r\n    Filter(\r\n        TH_WH_Locations,\r\n        crcfe_loc_name in colUniqueLocationNames.Value\r\n    )\r\n);\r\n\r\n// --- ส่วนที่ 6: คำนวณลำดับความสำคัญ (Priority Calculation Engine) ---\r\n// วนลูปตรวจสอบงานทีละชิ้น เพื่อให้คะแนนความสำคัญ\r\nClear(colItemsWithPrio);\r\nForAll(\r\n    colBaseItems As colItem, \r\n    With(\r\n        {\r\n            // ค้นหาข้อมูล Location และ Route จากตัวแปรที่เตรียมไว้\r\n            _location: LookUp(colLocationsData, Trim(crcfe_loc_name) = Trim(colItem.crcfe_locationid)),\r\n            _route: LookUp(colRouteRef, Title = colItem.DestinationCode) \r\n        },\r\n        \r\n        // ตรวจสอบว่า User มีสิทธิ์ใน Zone ของสินค้านี้หรือไม่\r\n        If(\r\n            _location.crcfe_loc_zone.TH_WH_Zone in colMyZoneLookups.Value,\r\n            With(\r\n                {\r\n                    // ดึงค่า Priority ของ Zone นั้นๆ\r\n                    _priority: LookUp(colMyPrio, crcfe_uzp_zone.TH_WH_Zone = _location.crcfe_loc_zone.TH_WH_Zone)\r\n                },\r\n                Collect(\r\n                    colItemsWithPrio,\r\n                    {\r\n                        DocumentNo: colItem.cr519_loadexportno, \r\n                        // Priority ตามเวลา: หลัง 16:00 บ่ายสำคัญสุด, ก่อน 16:00 เช้าสำคัญสุด\r\n                        CalculatedRoundPriority: If(\r\n                            varCurrentTimeVal > 16.0,\r\n                            If(colItem.crcfe_round = \"Afternoon\", 1, 2),\r\n                            If(colItem.crcfe_round = \"Morning\", 1, 2)\r\n                        ),\r\n                        // คำนวณคะแนน Priority (ถ้าหาไม่เจอ ให้เป็น 99)\r\n                        CalculatedZonePriority: If(IsBlank(_priority), 99, _priority.uzp_priority),\r\n                        CalculatedRoutePriority: If(IsBlank(_route), 99, _route.routePriority), \r\n                        \r\n                        FullItemRecord: colItem\r\n                    }\r\n                )\r\n            )\r\n        )\r\n    )\r\n);\r\n\r\n// --- ส่วนที่ 7: สรุปผลและจัดกลุ่ม (Aggregation) ---\r\n// 7.1 จัดกลุ่มรายการตามเลขที่เอกสาร (Load No.)\r\nClearCollect(colGroupedDocs, GroupBy(colItemsWithPrio, DocumentNo, _items));\r\n\r\n// 7.2 หาค่า Priority ที่สำคัญที่สุด (เลขน้อยที่สุด) ของแต่ละเอกสาร เพื่อใช้จัดเรียง\r\nClear(colFinalLoadExportList);\r\nForAll(\r\n    colGroupedDocs,\r\n    Collect(\r\n        colFinalLoadExportList,\r\n        {\r\n            cr519_loadexportno: ThisRecord.DocumentNo, \r\n            DocRoundPriority: Min(ThisRecord._items, CalculatedRoundPriority),\r\n            HighestZonePriority: Min(ThisRecord._items, CalculatedZonePriority),\r\n            DocRoutePriority: Min(ThisRecord._items, CalculatedRoutePriority)\r\n        }\r\n    )\r\n);\r\n\r\n// --- ส่วนที่ 8: จบการทำงาน ---\r\n// ตั้งค่าตัวแปรเริ่มต้น และปิด Loading Spinner\r\nSet(Timerstart,true);\r\nSetFocus(tagInput);\r\nSet(usernameN,User().FullName);\r\nUpdateContext({ var_showLoader: false });\r\n\r\n// ... (โค้ดโหลดข้อมูลเดิมของคุณจบที่นี่: Set(isLoading, false)) ...\r\n\r\n// --- [ส่วนกู้คืนงานค้าง (Resume Session)] ---\r\n\r\n// 1. ค้นหาว่า User คนนี้ มีงานที่ \"เลือกค้างไว้\" (Status = 1) หรือไม่?\r\n// (สมมติว่า pickerLoad เก็บชื่อ User หรือ Email)\r\nWith(\r\n    {\r\n        _stuckLoad: LookUp(\r\n            SNP_LoadExportSalesOrders, \r\n            selectedLoad = 1 && pickerLoad = User().FullName // หรือใช้ Email ตามที่คุณเก็บ\r\n        )\r\n    },\r\n\r\n    // 2. ถ้าเจองานค้าง (_stuckLoad ไม่ว่างเปล่า)\r\n    If(\r\n        !IsBlank(_stuckLoad),\r\n        \r\n        // แจ้งเตือน User นิดหน่อย\r\n        Notify(\"⚠️ พบงานค้างหมายเลข \" & _stuckLoad.LoadExportNo & \" ระบบกำลังพากลับไปหน้าทำงาน...\", NotificationType.Information);\r\n        \r\n        // 3. [สำคัญมาก] \"กู้คืนข้อมูล\" (Re-hydrate Data)\r\n        // เราต้องดึงรายการของใน Load นั้นมาใส่ Collection ให้เหมือนตอนกดปุ่ม Proceed เป๊ะๆ\r\n        // (เราดึงใหม่โดยเฉพาะเจาะจงเลข Load นี้เลย ไม่สนเงื่อนไขวันที่)\r\n        \r\n        // 3.1 ดึงรายการของ (Items) ของ Load นี้\r\n        ClearCollect(\r\n            colResumeItems, // สร้าง Collection ชั่วคราว\r\n            Filter(\r\n                SNP_LoadExportSalesOrders,\r\n                LoadExportNo = _stuckLoad.LoadExportNo\r\n            )\r\n        );\r\n        Set(gblCurrentLoad, _stuckLoad);\r\n        // 3.2 คำนวณ Priority ใหม่ (เพื่อให้หน้า Submit เรียงถูก)\r\n        // (ใช้ Logic เดิมของคุณ แต่ทำเฉพาะ Load นี้)\r\n            ClearCollect(\r\n                LoadExportCollection,\r\n                Filter(\r\n                    SNP_LoadExportSalesOrders,\r\n                    LoadExportNo = gblCurrentLoad.cr519_loadexportno \r\n                )\r\n            );\r\n        \r\n        // ** หมายเหตุ: ตรงนี้คุณอาจต้อง copy logic การคำนวณ Priority ย่อๆ มาใส่ \r\n        // หรือถ้าหน้า Submit ไม่ได้ใช้ Priority ในการเรียง ก็ข้ามการคำนวณซับซ้อนไปได้ **\r\n        // สมมติว่าหน้า Submit ต้องการแค่รายการของ:\r\n\r\n        // 3.3 เตรียม Collection ย่อยอื่นๆ (ตามโค้ด OnChange เดิมของคุณ)\r\n        ClearCollect(\r\n            ItemMasterCollection,\r\n            ShowColumns(Filter(SNP_ItemMasters, ItemID in LoadExportCollection.ItemID), ProductName, BrandID, Company, ItemID, MPN, SNTrack, UPC, VendorID)\r\n        );\r\n\r\n        ClearCollect(\r\n                    FinalCollection,\r\n                    AddColumns(\r\n                        LoadExportCollection,\r\n                        cr519_upc, LookUp(ItemMasterCollection, cr519_itemid = LoadExportCollection[@ItemID], cr519_upc),\r\n                        cr519_brandid, LookUp(ItemMasterCollection, cr519_itemid = LoadExportCollection[@ItemID], cr519_brandid),\r\n                        company, LookUp(ItemMasterCollection, cr519_itemid = LoadExportCollection[@ItemID], cr519_company),\r\n                        cr519_productname, LookUp(ItemMasterCollection, cr519_itemid = LoadExportCollection[@ItemID], cr519_productname),\r\n                        cr519_sntrack, LookUp(ItemMasterCollection, cr519_itemid = LoadExportCollection[@ItemID], cr519_sntrack),\r\n                        'Line RECID', LookUp(ItemMasterCollection, cr519_itemid = LoadExportCollection[@ItemID], LineRECID),\r\n                        'Line Number', LookUp(ItemMasterCollection, cr519_itemid = LoadExportCollection[@ItemID], LineNumber)\r\n                    )\r\n                );\r\n\r\n        // 4. จำลองการเลือก Combobox (เพื่อให้สูตรอื่นๆ ที่อ้างอิง LoadExportBox.Selected ไม่พัง)\r\n        // (อาจต้องตั้งตัวแปร varSelectedLoad แทนการใช้ Control โดยตรงในหน้าอื่น)\r\n        // Set(varCurrentLoadNo, _stuckLoad.LoadExportNo); \r\n    \r\n        // 5. ไปหน้า Submit เลย\r\n        Select(resumeBT)\r\n    )\r\n);"
+    Children:
+      - tmrCheckRound:
+          Control: Timer@2.1.0
+          Properties:
+            AutoPause: =false
+            AutoStart: =true
+            BorderColor: =ColorFade(Self.Fill, -15%)
+            Color: =RGBA(255, 255, 255, 1)
+            DisabledBorderColor: =ColorFade(Self.BorderColor, 70%)
+            DisabledColor: =ColorFade(Self.Fill, 90%)
+            DisabledFill: =ColorFade(Self.Fill, 70%)
+            Duration: =30000
+            Fill: =RGBA(56, 96, 178, 1)
+            Font: =Font.'Open Sans'
+            HoverBorderColor: =ColorFade(Self.BorderColor, 20%)
+            HoverColor: =RGBA(255, 255, 255, 1)
+            HoverFill: =ColorFade(RGBA(56, 96, 178, 1), -20%)
+            OnTimerEnd: "=// 1. คำนวณรอบเวลา \"ณ วินาทีนี้\"\r\nUpdateContext({ _currentHourVal: Hour(Now()) + Minute(Now())/60 });\r\nUpdateContext({ _checkCurrentRound: \r\n    If(_currentHourVal > 10.5 && _currentHourVal <= 16.0, \"Afternoon\", \"Morning\")\r\n});\r\n\r\n// 2. เช็คว่ารอบเปลี่ยนไหม? (เทียบกับตัวแปร varActiveRound ที่ใช้อยู่)\r\nIf(\r\n    _checkCurrentRound <> varActiveRound, \r\n    \r\n    // 3. ถ้ารอบเปลี่ยน! ให้แจ้งเตือนและโหลดข้อมูลใหม่\r\n    Notify(\"⏳ ถึงเวลาเปลี่ยนรอบงาน ระบบกำลังรีเฟรชข้อมูล...\", NotificationType.Information);\r\n    \r\n    // เรียกใช้โค้ดโหลดข้อมูลใหม่ทั้งหมด (เหมือนตอน OnVisible)\r\n    Select(btnRefreshData); // (สมมติว่าคุณเอาโค้ดโหลดข้อมูลไปแปะไว้ที่ปุ่มนี้)\r\n);"
+            PressedBorderColor: =Self.Fill
+            PressedColor: =Self.Fill
+            PressedFill: =Self.Color
+            Repeat: =true
+            Visible: =false
+            X: =27
+            Y: =157
+      - onBrowser:
+          Control: Label@2.5.1
+          Properties:
+            BorderColor: =RGBA(0, 18, 107, 1)
+            Font: =Font.'Open Sans'
+            Size: =15
+            Text: =//"On Web Browser is " & OnBrowser
+            Visible: =false
+            Width: =259
+            X: =376
+            Y: =1048
+      - LoadExportGallery:
+          Control: Gallery@2.15.0
+          Variant: BrowseLayout_Vertical_ThreeTextVariant_ver4.0
+          Properties:
+            BorderColor: =RGBA(0, 18, 107, 1)
+            BorderThickness: =1
+            Height: =332
+            Items: =LoadExportCollection
+            TemplateSize: =142
+            Visible: =false
+            Y: =744
+          Children:
+            - Separator2_2:
+                Control: Rectangle@2.3.0
+                Properties:
+                  BorderColor: =RGBA(0, 18, 107, 1)
+                  Fill: =RGBA(0, 18, 107, 1)
+                  Height: =1
+                  OnSelect: =Select(Parent)
+                  Width: =Parent.TemplateWidth
+                  Y: =141
+            - Subtitle2_14:
+                Control: Label@2.5.1
+                Properties:
+                  BorderColor: =RGBA(0, 0, 0, 1)
+                  Font: =Font.'Open Sans'
+                  Height: =40
+                  OnSelect: =Select(Parent)
+                  Overflow: =Overflow.Scroll
+                  PaddingBottom: =0
+                  PaddingLeft: =0
+                  PaddingRight: =0
+                  PaddingTop: =0
+                  Size: =18
+                  Text: |-
+                    ="Location : " & ThisItem.WHLocationID
+                  VerticalAlign: =VerticalAlign.Top
+                  Width: =283
+                  X: =32
+                  Y: =59
+            - Subtitle2_12:
+                Control: Label@2.5.1
+                Properties:
+                  BorderColor: =RGBA(0, 0, 0, 1)
+                  Font: =Font.'Open Sans'
+                  FontWeight: =FontWeight.Bold
+                  Height: =50
+                  OnSelect: =Select(Parent)
+                  PaddingBottom: =0
+                  PaddingLeft: =0
+                  PaddingRight: =0
+                  PaddingTop: =0
+                  Size: =28
+                  Text: |-
+                    ="MPN : " & ThisItem.MPN
+                  VerticalAlign: =VerticalAlign.Top
+                  Width: =595
+                  X: =32
+                  Y: =8
+            - Subtitle2_13:
+                Control: Label@2.5.1
+                Properties:
+                  BorderColor: =RGBA(0, 0, 0, 1)
+                  Font: =Font.'Open Sans'
+                  Height: =27
+                  OnSelect: =Select(Parent)
+                  PaddingBottom: =0
+                  PaddingLeft: =0
+                  PaddingRight: =0
+                  PaddingTop: =0
+                  Size: =18
+                  Text: |-
+                    ="QTY : " & ThisItem.Quantity
+                  VerticalAlign: =VerticalAlign.Top
+                  Width: =125
+                  X: =32
+                  Y: =99
+            - itemIDMainG:
+                Control: Label@2.5.1
+                Properties:
+                  BorderColor: =RGBA(0, 0, 0, 1)
+                  Font: =Font.'Open Sans'
+                  Height: =27
+                  OnSelect: =Select(Parent)
+                  PaddingBottom: =0
+                  PaddingLeft: =0
+                  PaddingRight: =0
+                  PaddingTop: =0
+                  Size: =18
+                  Text: =ThisItem.ItemID
+                  VerticalAlign: =VerticalAlign.Top
+                  Visible: =false
+                  Width: =125
+                  X: =270
+                  Y: =99
+            - snTrackMainG:
+                Control: Label@2.5.1
+                Properties:
+                  BorderColor: =RGBA(0, 18, 107, 1)
+                  Font: =Font.'Open Sans'
+                  Height: =59
+                  OnSelect: =Select(Parent)
+                  Text: =LookUp(SNP_ItemMasters,ItemID = itemIDMainG.Text,SNTrack)
+                  Visible: =false
+                  Width: =369
+                  X: =230
+                  Y: =70
+            - Subtitle2_15:
+                Control: Label@2.5.1
+                Properties:
+                  BorderColor: =RGBA(0, 0, 0, 1)
+                  Font: =Font.'Open Sans'
+                  Height: =30
+                  OnSelect: =Select(Parent)
+                  PaddingBottom: =0
+                  PaddingLeft: =0
+                  PaddingRight: =0
+                  PaddingTop: =0
+                  Size: =18
+                  Text: |-
+                    ="SN Track : " & snTrackMainG.Text
+                  VerticalAlign: =VerticalAlign.Top
+                  Width: =149
+                  X: =478
+                  Y: =58
+            - Button5:
+                Control: Classic/Button@2.2.0
+                Properties:
+                  BorderColor: =ColorFade(Self.Fill, -15%)
+                  Color: =RGBA(255, 255, 255, 1)
+                  DisabledBorderColor: =RGBA(166, 166, 166, 1)
+                  Fill: =RGBA(56, 96, 178, 1)
+                  Font: =Font.'Open Sans'
+                  Height: =30
+                  HoverBorderColor: =ColorFade(Self.BorderColor, 20%)
+                  HoverColor: =RGBA(255, 255, 255, 1)
+                  HoverFill: =ColorFade(RGBA(56, 96, 178, 1), -20%)
+                  OnSelect: "=/*\r\nIf(IsBlank(LookUp(SNP_ItemMasters,ItemID = ThisItem.ItemID,UPC)),Notify(\"Can not Change,UPC is empty\",NotificationType.Error,3000),\r\nPatch(SNP_ItemMasters,LookUp(SNP_ItemMasters,ItemID = itemIDMainG.Text),\r\n    {SNTrack: 1,\r\n    Changed: 1\r\n    \r\n    }\r\n));\r\n\r\nClearCollect(ItemMasterCollection,ShowColumns(Filter(SNP_ItemMasters,ItemID in LoadExportCollection.ItemID),ProductName,BrandID,Company,ItemID,MPN,SNTrack,UPC,VendorID));\r\n*/"
+                  PressedBorderColor: =Self.Fill
+                  PressedColor: =Self.Fill
+                  PressedFill: =Self.Color
+                  Size: =18
+                  Text: ="Req Track"
+                  Width: =148
+                  X: =467
+                  Y: =88
+            - UPCMainG:
+                Control: Label@2.5.1
+                Properties:
+                  BorderColor: =RGBA(0, 18, 107, 1)
+                  Font: =Font.'Open Sans'
+                  Height: =59
+                  OnSelect: =Select(Parent)
+                  Text: =LookUp(SNP_ItemMasters,ItemID = itemIDMainG.Text,UPC)
+                  Visible: =false
+                  Width: =369
+                  X: =40
+                  Y: =40
+      - UserNHide:
+          Control: Classic/TextInput@2.3.2
+          Properties:
+            BorderColor: =RGBA(0, 18, 107, 1)
+            Default: =User().FullName & " User() Function"
+            Font: =Font.'Open Sans'
+            HoverBorderColor: =RGBA(0, 18, 107, 1)
+            HoverFill: =RGBA(186, 202, 226, 1)
+            Mode: =TextMode.MultiLine
+            Visible: =false
+            X: =40
+            Y: =60
+      - UserN:
+          Control: Classic/TextInput@2.3.2
+          Properties:
+            BorderColor: =RGBA(0, 18, 107, 1)
+            Default: |-
+              ="User : " & Office365Users.MyProfileV2().givenName
+            Font: =Font.'Open Sans'
+            FontWeight: =FontWeight.Bold
+            Height: =54
+            HoverBorderColor: =RGBA(0, 18, 107, 1)
+            HoverFill: =RGBA(186, 202, 226, 1)
+            Size: =18
+            Width: =509
+            X: =24
+            Y: =89
+      - Version:
+          Control: Label@2.5.1
+          Properties:
+            BorderColor: =RGBA(0, 18, 107, 1)
+            Font: =Font.'Open Sans'
+            Height: =48
+            PaddingLeft: =0
+            Size: =15
+            Text: |-
+              =" Version: 0.9.180"
+            Width: =171
+            X: =465
+            Y: =1085
+      - Newform:
+          Control: Classic/Button@2.2.0
+          Properties:
+            BorderColor: =ColorFade(Self.Fill, -15%)
+            Color: =RGBA(255, 255, 255, 1)
+            DisabledBorderColor: =RGBA(166, 166, 166, 1)
+            Fill: =RGBA(56, 96, 178, 1)
+            Font: =Font.'Open Sans'
+            Height: =64
+            HoverBorderColor: =ColorFade(Self.BorderColor, 20%)
+            HoverColor: =RGBA(255, 255, 255, 1)
+            HoverFill: =ColorFade(RGBA(56, 96, 178, 1), -20%)
+            OnSelect: "=If(\r\n    LookUp(SNP_LoadExportSalesOrders,LoadExportNo = LoadExportBox.Selected.cr519_loadexportno,selectedLoad) = 1,\r\n    Notify(\"รายการนี้ถูกเลือกไปแล้ว กรุณาเลือกรายการอื่น\", NotificationType.Error);\r\n    Refresh(SNP_LoadExportSalesOrders);\r\n    Reset(LoadExportBox);,\r\n    LookUp(SNP_LoadExportSalesOrders,LoadExportNo = LoadExportBox.Selected.cr519_loadexportno,selectedLoad) = 2,\r\n    Notify(\"รายการนี้ถูกยกเลิก กรุณาติดต่อส่วนกลาง\", NotificationType.Error);\r\n    Refresh(SNP_LoadExportSalesOrders);\r\n    Reset(LoadExportBox);,\r\n\r\n//\r\nClearCollect(\r\n    colFilteredItems,\r\n    Filter(\r\n        SNP_LoadExportSalesOrders,\r\n        LoadExportNo = LoadExportBox.Selected.cr519_loadexportno\r\n    )\r\n);\r\n    ForAll(\r\n    colFilteredItems As item,\r\n    Patch(\r\n        SNP_LoadExportSalesOrders,\r\n        item,\r\n        {\r\n            selectedLoad: 1,\r\n            StatusApp:\"Picking\",\r\n            pickingTag:tagInput.Text,\r\n            pickerLoad: usernameN\r\n        }\r\n    )\r\n);\r\n\r\n\r\nIf(\r\n    IsBlank(tagInput.Text),\r\n    Notify(\"Please scan tag input\", NotificationType.Error),\r\n    IsBlank(LoadExportBox.Selected),\r\n    Notify(\"Please Select Load Export Number\", NotificationType.Error),\r\n\r\n    Navigate('Submit Screen');\r\n    ClearCollect(confirmed,\r\n        {LoadExportNo:\"\"},\r\n        {SalesOrderNo:\"\"},\r\n        {LineRECID:\"\"},\r\n        {LineNumber:\"\"},\r\n        {ItemID:\"\"},\r\n        {UPC:\"\"},\r\n        {SerialNo:\"\"},\r\n        {Company:\"\"},\r\n        {MPN:\"\"},\r\n        {sent:\"\"}\r\n    )\r\n);\r\n\r\n\r\nClear(confirmed);\r\n\r\n);\r\n\r\n\r\n// Duration Picking\r\nSet(varTimerRunning, true);\r\nSet(varResetTimer, false);\r\nSet(varStartTime, Now());\r\n\r\nSet(gblCurrentLoad, LoadExportBox.Selected)\r\n\r\n/*\r\n\r\n    UpdateIf(    SNP_LoadExportSalesOrders, LoadExportNo = LoadExportBox.Selected.cr519_loadexportno, { \r\n        selectedLoad: 1,\r\n        pickerLoad: usernameN\r\n        \r\n        }\r\n    );\r\n\r\n    */"
+            PressedBorderColor: =Self.Fill
+            PressedColor: =Self.Fill
+            PressedFill: =Self.Color
+            Text: ="Proceed"
+            Width: =204
+            X: =232
+            Y: =843
+      - Component1_3:
+          Control: CanvasComponent
+          ComponentName: Component1
+          Properties:
+            Height: =70
+      - Label5_1:
+          Control: Label@2.5.1
+          Properties:
+            BorderColor: =RGBA(0, 18, 107, 1)
+            Color: =RGBA(221, 79, 14, 1)
+            Font: =Font.'Open Sans'
+            FontWeight: =FontWeight.Bold
+            Height: =36
+            Size: =18
+            Text: ="Select Load Export Number"
+            Width: =586
+            X: =27
+            Y: =363
+      - CompanyN:
+          Control: Classic/TextInput@2.3.2
+          Properties:
+            Align: =Align.Center
+            BorderColor: =RGBA(0, 18, 107, 1)
+            Default: |-
+              =If(Office365Users.MyProfileV2().companyName = "Sonepar (Thailand) Limited","STH",
+                  Office365Users.MyProfileV2().companyName = "SONIC AUTOMATION LTD","SON","QT")
+            Font: =Font.'Open Sans'
+            FontWeight: =FontWeight.Bold
+            Height: =54
+            HoverBorderColor: =RGBA(0, 18, 107, 1)
+            HoverFill: =RGBA(186, 202, 226, 1)
+            PaddingBottom: =0
+            PaddingLeft: =0
+            PaddingRight: =0
+            PaddingTop: =0
+            Size: =18
+            Width: =63
+            X: =555
+            Y: =89
+      - LEDetailHeader:
+          Control: Label@2.5.1
+          Properties:
+            BorderColor: =RGBA(0, 18, 107, 1)
+            BorderThickness: =1
+            Color: =RGBA(255, 255, 255, 1)
+            Fill: =RGBA(102, 182, 227, 1)
+            Font: =Font.'Open Sans'
+            Height: =38
+            Text: ="Load Export Preview"
+            Visible: =false
+            Width: =640
+            Y: =548
+      - companyText:
+          Control: Classic/TextInput@2.3.2
+          Properties:
+            BorderColor: =RGBA(0, 18, 107, 1)
+            Default: "=/*If(User().Email = \"nopradon.m@soneparthailand.com\",\"son\",\r\n    User().Email = \"a-bot@soneparsea.com\",\"son\",\r\n    Office365Users.MyProfileV2().companyName = \"Sonepar (Thailand) Limited\",\"dep\",\r\n    Office365Users.MyProfileV2().companyName = \"SONIC AUTOMATION LTD\",\"son\"\r\n    ,\"qt\")\r\n    \r\n    */\r\n    \"dep\""
+            Font: =Font.'Open Sans'
+            Height: =45
+            HoverBorderColor: =RGBA(0, 18, 107, 1)
+            HoverFill: =RGBA(186, 202, 226, 1)
+            Visible: =false
+            Width: =102
+            X: =516
+            Y: =376
+      - LoadExportBox:
+          Control: Classic/ComboBox@2.4.0
+          Properties:
+            BorderColor: =RGBA(0, 18, 107, 1)
+            ChevronBackground: =RGBA(56, 96, 178, 1)
+            ChevronFill: =RGBA(255, 255, 255, 1)
+            ChevronHoverBackground: =ColorFade(RGBA(56, 96, 178, 1), -20%)
+            ChevronHoverFill: =RGBA(255, 255, 255, 1)
+            DisplayFields: =["cr519_loadexportno"]
+            Font: =Font.'Open Sans'
+            Height: =73
+            HoverFill: =RGBA(186, 202, 226, 1)
+            InputTextPlaceholder: ="Find Load Export Number"
+            Items: "=//SortByColumns(ForAll(Distinct(Filter(SNP_LoadExportSalesOrders,Company=companyText.Text&&Scanned=0),cr519_loadexportno),{Result:ThisRecord.Value}),\"Result\",SortOrder.Descending)\r\n/*SortByColumns(\r\n    DropColumns(\r\n    GroupBy(\r\n            Filter(\r\n                SNP_LoadExportSalesOrders,\r\n                Company = companyText.Text && Scanned = 0 &&\r\n                DeliveryDate >= DateAdd(Today(), -10, TimeUnit.Days) &&\r\n                DeliveryDate <= DateAdd(Today(), 5, TimeUnit.Days) && \r\n                (IsBlank(selectedLoad) || selectedLoad = 0) \r\n                //&&StartsWith(WHLocationID,whBox.Selected.Value)\r\n            ),\r\n            LoadExportNo,Company\r\n        ),Company)\r\n        \r\n        ,\"cr519_loadexportno\",SortOrder.Descending\r\n)\r\n*/\r\nSortByColumns(\r\n    colFinalLoadExportList,\r\n    \"DocRoundPriority\", SortOrder.Ascending,\r\n    \"HighestZonePriority\", SortOrder.Ascending,\r\n    \"DocRoutePriority\", SortOrder.Ascending,\r\n    \"cr519_loadexportno\", SortOrder.Descending\r\n)"
+            OnChange: |
+              =//Filter(SNP_LoadExportSalesOrders,LoadExportNo = ComboBox1_1.Selected.Result && Company = CompanyRequester.Text);
+              //ClearCollect(LoadExportCollection,Filter(SNP_LoadExportSalesOrders,LoadExportNo = LoadExportBox.Selected.Result && Scanned = 0));
+              ClearCollect(
+                  LoadExportCollection,
+                  Filter(
+                      SNP_LoadExportSalesOrders,
+                      LoadExportNo = LoadExportBox.Selected.cr519_loadexportno 
+                      //&& Scanned = 0
+                  )
+              );
+              ClearCollect(
+                  ItemMasterCollection,
+                  ShowColumns(
+                      Filter(
+                          SNP_ItemMasters,
+                          ItemID in LoadExportCollection.ItemID
+                      ),
+                      ProductName,
+                      BrandID,
+                      Company,
+                      ItemID,
+                      MPN,
+                      SNTrack,
+                      UPC,
+                      VendorID
+                  )
+              );
+              ClearCollect(
+                  FinalCollection,
+                  AddColumns(
+                      LoadExportCollection,
+                      cr519_upc,
+                      LookUp(
+                          ItemMasterCollection,
+                          cr519_itemid = LoadExportCollection[@ItemID],
+                          cr519_upc
+                      ),
+                      cr519_brandid,
+                      LookUp(
+                          ItemMasterCollection,
+                          cr519_itemid = LoadExportCollection[@ItemID],
+                          cr519_brandid
+                      ),
+                      company,
+                      LookUp(
+                          ItemMasterCollection,
+                          cr519_itemid = LoadExportCollection[@ItemID],
+                          cr519_company
+                      ),
+                      cr519_productname,
+                      LookUp(
+                          ItemMasterCollection,
+                          cr519_itemid = LoadExportCollection[@ItemID],
+                          cr519_productname
+                      ),
+                      cr519_sntrack,
+                      LookUp(
+                          ItemMasterCollection,
+                          cr519_itemid = LoadExportCollection[@ItemID],
+                          cr519_sntrack
+                      ),
+                      'Line RECID',
+                      LookUp(
+                          ItemMasterCollection,
+                          cr519_itemid = LoadExportCollection[@ItemID],
+                          LineRECID
+                      ),
+                      'Line Number',
+                      LookUp(
+                          ItemMasterCollection,
+                          cr519_itemid = LoadExportCollection[@ItemID],
+                          LineNumber
+                      )
+                  )
+              );
+              Refresh(SNP_LoadExportSalesOrders);
+            PressedColor: =RGBA(255, 255, 255, 1)
+            PressedFill: =RGBA(0, 18, 107, 1)
+            SearchFields: =["cr519_loadexportno"]
+            SelectMultiple: =false
+            SelectionColor: =RGBA(255, 255, 255, 1)
+            SelectionFill: =RGBA(56, 96, 178, 1)
+            Width: =593
+            X: =27
+            Y: =403
+      - CancelLEBT:
+          Control: Classic/Button@2.2.0
+          Properties:
+            BorderColor: =ColorFade(Self.Fill, -15%)
+            Color: =RGBA(255, 255, 255, 1)
+            DisabledBorderColor: =RGBA(166, 166, 166, 1)
+            Fill: =RGBA(255, 0, 0, 1)
+            Font: =Font.'Open Sans'
+            Height: =41
+            HoverBorderColor: =ColorFade(Self.BorderColor, 20%)
+            HoverColor: =RGBA(255, 255, 255, 1)
+            HoverFill: =ColorFade(RGBA(56, 96, 178, 1), -20%)
+            OnSelect: |-
+              =If(IsBlank(LoadExportBox.Selected),Notify("Plese Select Load Export Number First",NotificationType.Error),
+              Navigate('Cancel Screen');
+              )
+            PressedBorderColor: =Self.Fill
+            PressedColor: =Self.Fill
+            PressedFill: =Self.Color
+            Size: =15
+            Text: ="Cancel"
+            Visible: =false
+            Width: =163
+            X: =22
+            Y: =1085
+      - Label1:
+          Control: Label@2.5.1
+          Properties:
+            Align: =Align.Center
+            BorderColor: =RGBA(0, 18, 107, 1)
+            BorderThickness: =1
+            Font: =Font.'Open Sans'
+            Height: =45
+            Overflow: =Overflow.Scroll
+            Size: =18
+            Text: =LookUp(SNP_LoadExportSalesOrders,LoadExportNo = LoadExportBox.Selected.cr519_loadexportno,CustomerName)
+            Width: =593
+            Wrap: =false
+            X: =24
+            Y: =678
+      - Label1_1:
+          Control: Label@2.5.1
+          Properties:
+            Align: =Align.Center
+            BorderColor: =RGBA(0, 18, 107, 1)
+            BorderThickness: =1
+            Font: =Font.'Open Sans'
+            FontWeight: =FontWeight.Bold
+            Height: =44
+            Size: =18
+            Text: |-
+              ="Round: " //& LookUp(SNP_LoadExportSalesOrders,LoadExportNo = LoadExportBox.Selected.cr519_loadexportno,SalesOrderNo)
+            Width: =269
+            X: =24
+            Y: =500
+      - btnRefreshData:
+          Control: Classic/Icon@2.5.0
+          Properties:
+            BorderColor: =RGBA(0, 18, 107, 1)
+            Color: =RGBA(255, 255, 255, 1)
+            Height: =54
+            Icon: =Icon.Reload
+            OnSelect: "=UpdateContext({ var_showLoader: true });\r\nRefresh(SNP_LoadExportSalesOrders);\r\nRefresh(SNP_ItemMasters);\r\nRefresh(SNP_SerialNumbers);\r\nSet(varCurrentTimeVal, Hour(Now()) + Minute(Now())/60);\r\n//Set(varActiveRound,If(varCurrentTimeVal > 10.5 && varCurrentTimeVal <= 16.0, \"Afternoon\", \"Morning\"));\r\n\r\n// --- 1. ดึงสิทธิ์ Priority ของ User ที่ Login ---\r\nClearCollect(\r\n    colMyPrio,\r\n    Filter(\r\n        TH_WH_Priorities, \r\n        uzp_user.'Primary Email' = Office365Users.MyProfile().Mail\r\n    )\r\n);\r\n\r\n// --- 2. ดึง \"ID ของ Zone\" ที่มีสิทธิ์ (เร็ว) ---\r\nClearCollect(\r\n    colMyZoneLookups, \r\n    ForAll(\r\n        colMyPrio,\r\n        {\r\n            Value: uzp_zone.TH_WH_Zone \r\n        }\r\n    )\r\n);\r\n\r\nClearCollect(\r\n    colRouteRef, \r\n    whDestinationCode\r\n);\r\n\r\n// --- 3. ดึง \"รายการของ\" ที่กรองแล้ว (เร็ว) ---\r\nClearCollect(\r\n    colBaseItems,\r\n    Filter(\r\n        SNP_LoadExportSalesOrders,\r\n        Company = companyText.Text && \r\n        Scanned = 0 &&\r\n        // (ผมใช้ Date Filter ที่คุณลดแล้ว)\r\n        DeliveryDate >= Today() &&\r\n        DeliveryDate <= DateAdd(Today(), 15, TimeUnit.Days) &&\r\n        (IsBlank(selectedLoad) || selectedLoad = 0)\r\n        //&&round = varActiveRound\r\n\r\n    )\r\n);\r\n\r\n\r\n// 3.2 สร้าง Blacklist: หา \"เลข Load ที่มีปัญหา\" (Location ว่าง)\r\nClearCollect(\r\n    colInvalidLoads,\r\n    Distinct(\r\n        Filter(\r\n            colBaseItems, \r\n            IsBlank(crcfe_locationid) || crcfe_locationid = \"\" // เช็คว่า Location หายหรือไม่\r\n        ), \r\n        cr519_loadexportno\r\n    )\r\n);\r\n\r\n// 3.3 สร้าง colBaseItems ตัวจริง (โดยตัด Load ใน Blacklist ทิ้งทั้งใบ)\r\nClearCollect(\r\n    colBaseItems,\r\n    Filter(\r\n        colBaseItems,\r\n        !(cr519_loadexportno in colInvalidLoads.Value) // เอาเฉพาะเลขที่ไม่อยู่ใน Blacklist\r\n    )\r\n);\r\n// 3.5a: ดึง \"ชื่อ Location ที่ไม่ซ้ำกัน\" ออกมาจาก colBaseItems (ทำงานใน App, เร็วมาก)\r\nClearCollect(\r\n    colUniqueLocationNames,\r\n    Distinct(colBaseItems, crcfe_locationid)\r\n);\r\n\r\n// 3.5b: \"ยิง Query 1 ครั้ง\" ไปที่ Dataverse เพื่อดึงข้อมูล Location ทั้งหมดที่ตรงกัน\r\nClearCollect(\r\n    colLocationsData,\r\n    Filter(\r\n        TH_WH_Locations,\r\n        crcfe_loc_name in colUniqueLocationNames.Value\r\n    )\r\n);\r\n\r\n\r\n// --- [ส่วนที่ 3: คำนวณ Priority (Zone + Route)] ---\r\nClear(colItemsWithPrio);\r\nForAll(\r\n    colBaseItems As colItem, \r\n    With(\r\n        {\r\n            _location: LookUp(colLocationsData, crcfe_loc_name = colItem.crcfe_locationid),\r\n            \r\n            // [เพิ่มใหม่!] ค้นหา Route Priority จาก DestinationCode\r\n            // สมมติว่าใน SNP_... คอลัมน์ชื่อ DestinationCode\r\n            // และใน SharePoint คอลัมน์ชื่อ Title\r\n            _route: LookUp(colRouteRef, Title = colItem.DestinationCode) \r\n        },\r\n        \r\n        If(\r\n            _location.crcfe_loc_zone.TH_WH_Zone in colMyZoneLookups.Value,\r\n            With(\r\n                {\r\n                    _priority: LookUp(colMyPrio, crcfe_uzp_zone.TH_WH_Zone = _location.crcfe_loc_zone.TH_WH_Zone)\r\n                },\r\n                Collect(\r\n                    colItemsWithPrio,\r\n                    {\r\n                        DocumentNo: colItem.cr519_loadexportno, \r\n                        // Priority ตามเวลา: หลัง 16:00 บ่ายสำคัญสุด, ก่อน 16:00 เช้าสำคัญสุด\r\n                        CalculatedRoundPriority: If(\r\n                            varCurrentTimeVal > 16.0,\r\n                            If(colItem.crcfe_round = \"Afternoon\", 1, 2),\r\n                            If(colItem.crcfe_round = \"Morning\", 1, 2)\r\n                        ),\r\n                        CalculatedZonePriority: If(IsBlank(_priority), 99, _priority.uzp_priority),\r\n                        CalculatedRoutePriority: If(IsBlank(_route), 99, _route.routePriority), \r\n                        \r\n                        FullItemRecord: colItem\r\n                    }\r\n                )\r\n            )\r\n        )\r\n    )\r\n);\r\n\r\n// --- [ส่วนที่ 4: GroupBy และสร้าง Final List] ---\r\nClearCollect(colGroupedDocs, GroupBy(colItemsWithPrio, DocumentNo, _items));\r\n\r\nClear(colFinalLoadExportList);\r\nForAll(\r\n    colGroupedDocs,\r\n    Collect(\r\n        colFinalLoadExportList,\r\n        {\r\n            cr519_loadexportno: ThisRecord.DocumentNo, \r\n            // หา Round ของเอกสารนี้\r\n            DocRoundPriority: Min(ThisRecord._items, CalculatedRoundPriority),\r\n            \r\n            // หา Zone Priority (เลขน้อยสุด) ของเอกสารนี้\r\n            HighestZonePriority: Min(ThisRecord._items, CalculatedZonePriority),\r\n            \r\n            // หา Route Priority ของเอกสารนี้ (ปกติเลขเดียวกันทั้งใบ)\r\n            DocRoutePriority: Min(ThisRecord._items, CalculatedRoutePriority)\r\n        }\r\n    )\r\n);\r\n\r\n\r\n\r\nSetFocus(tagInput);\r\nUpdateContext({ var_showLoader: false });"
+            Width: =46
+            X: =572
+            Y: =8
+      - ViewTraction:
+          Control: Classic/Button@2.2.0
+          Properties:
+            BorderColor: =ColorFade(Self.Fill, -15%)
+            Color: =RGBA(255, 255, 255, 1)
+            DisabledBorderColor: =RGBA(166, 166, 166, 1)
+            Fill: =RGBA(50, 86, 160, 1)
+            Font: =Font.'Open Sans'
+            Height: =41
+            HoverBorderColor: =ColorFade(Self.BorderColor, 20%)
+            HoverColor: =RGBA(255, 255, 255, 1)
+            HoverFill: =ColorFade(RGBA(56, 96, 178, 1), -20%)
+            OnSelect: =Navigate('View Transection Screen')
+            PressedBorderColor: =Self.Fill
+            PressedColor: =Self.Fill
+            PressedFill: =Self.Color
+            Size: =15
+            Text: ="View"
+            Width: =163
+            X: =40
+            Y: =1085
+      - Timer2:
+          Control: Timer@2.1.0
+          Properties:
+            AutoStart: =true
+            BorderColor: =ColorFade(Self.Fill, -15%)
+            Color: =RGBA(255, 255, 255, 1)
+            DisabledBorderColor: =ColorFade(Self.BorderColor, 70%)
+            DisabledColor: =ColorFade(Self.Fill, 90%)
+            DisabledFill: =ColorFade(Self.Fill, 70%)
+            Duration: =180000
+            Fill: =RGBA(56, 96, 178, 1)
+            Font: =Font.'Open Sans'
+            Height: =54
+            HoverBorderColor: =ColorFade(Self.BorderColor, 20%)
+            HoverColor: =RGBA(255, 255, 255, 1)
+            HoverFill: =ColorFade(RGBA(56, 96, 178, 1), -20%)
+            OnTimerEnd: |-
+              =Refresh(SNP_LoadExportSalesOrders);
+              Refresh(SNP_ItemMasters);
+              Refresh(SNP_SerialNumbers);
+            PressedBorderColor: =Self.Fill
+            PressedColor: =Self.Fill
+            PressedFill: =Self.Color
+            Repeat: =true
+            Visible: =false
+            Width: =163
+            X: =22
+            Y: =378
+      - Label5:
+          Control: Label@2.5.1
+          Properties:
+            BorderColor: =RGBA(0, 18, 107, 1)
+            Font: =Font.'Open Sans'
+            Text: =CountRows(Filter(SNP_LoadExportSalesOrders,Company = companyText.Text && Scanned = 0))
+            Visible: =false
+            Width: =119
+            X: =516
+            Y: =370
+      - tagInput:
+          Control: Classic/TextInput@2.3.2
+          Properties:
+            BorderColor: =RGBA(0, 18, 107, 1)
+            Default: =
+            Font: =Font.'Open Sans'
+            HintText: ="Scan Tag Number"
+            HoverBorderColor: =RGBA(0, 18, 107, 1)
+            HoverFill: =RGBA(186, 202, 226, 1)
+            OnChange: "=Refresh(SNP_LoadExportSalesOrders);\r\nRefresh(SNP_ItemMasters);\r\nRefresh(SNP_SerialNumbers);\r\n\r\nIf(\r\n    !IsBlank(LookUp(SNP_LoadExportSalesOrders, pickingTag = tagInput.Text)), \r\n    Notify(\"Tag นี้ ถูกใช้งานอยู่\", NotificationType.Error);\r\n    Reset(tagInput),\r\n\r\nUpdateContext({ var_showLoader: true });\r\n\r\nSet(varCurrentTimeVal, Hour(Now()) + Minute(Now())/60);\r\n//Set(varActiveRound,If(varCurrentTimeVal > 10.5 && varCurrentTimeVal <= 16.0, \"Afternoon\", \"Morning\"));\r\n\r\n// --- 1. ดึงสิทธิ์ Priority ของ User ที่ Login ---\r\nClearCollect(\r\n    colMyPrio,\r\n    Filter(\r\n        TH_WH_Priorities, \r\n        uzp_user.'Primary Email' = Office365Users.MyProfile().Mail\r\n    )\r\n);\r\n\r\n// --- 2. ดึง \"ID ของ Zone\" ที่มีสิทธิ์ (เร็ว) ---\r\nClearCollect(\r\n    colMyZoneLookups, \r\n    ForAll(\r\n        colMyPrio,\r\n        {\r\n            Value: uzp_zone.TH_WH_Zone \r\n        }\r\n    )\r\n);\r\n\r\nClearCollect(\r\n    colRouteRef, \r\n    whDestinationCode\r\n);\r\n\r\n// --- 3. ดึง \"รายการของ\" ที่กรองแล้ว (เร็ว) ---\r\nClearCollect(\r\n    colBaseItems,\r\n    Filter(\r\n        SNP_LoadExportSalesOrders,\r\n        Company = companyText.Text && \r\n        Scanned = 0 &&\r\n        // (ผมใช้ Date Filter ที่คุณลดแล้ว)\r\n        DeliveryDate >= Today() &&\r\n        DeliveryDate <= DateAdd(Today(), 15, TimeUnit.Days) &&\r\n        (IsBlank(selectedLoad) || selectedLoad = 0)\r\n        //&&round = varActiveRound\r\n\r\n    )\r\n);\r\n\r\n\r\n// 3.2 สร้าง Blacklist: หา \"เลข Load ที่มีปัญหา\" (Location ว่าง)\r\nClearCollect(\r\n    colInvalidLoads,\r\n    Distinct(\r\n        Filter(\r\n            colBaseItems, \r\n            IsBlank(crcfe_locationid) || crcfe_locationid = \"\" // เช็คว่า Location หายหรือไม่\r\n        ), \r\n        cr519_loadexportno\r\n    )\r\n);\r\n\r\n// 3.3 สร้าง colBaseItems ตัวจริง (โดยตัด Load ใน Blacklist ทิ้งทั้งใบ)\r\nClearCollect(\r\n    colBaseItems,\r\n    Filter(\r\n        colBaseItems,\r\n        !(cr519_loadexportno in colInvalidLoads.Value) // เอาเฉพาะเลขที่ไม่อยู่ใน Blacklist\r\n    )\r\n);\r\n// 3.5a: ดึง \"ชื่อ Location ที่ไม่ซ้ำกัน\" ออกมาจาก colBaseItems (ทำงานใน App, เร็วมาก)\r\nClearCollect(\r\n    colUniqueLocationNames,\r\n    Distinct(colBaseItems, crcfe_locationid)\r\n);\r\n\r\n// 3.5b: \"ยิง Query 1 ครั้ง\" ไปที่ Dataverse เพื่อดึงข้อมูล Location ทั้งหมดที่ตรงกัน\r\nClearCollect(\r\n    colLocationsData,\r\n    Filter(\r\n        TH_WH_Locations,\r\n        crcfe_loc_name in colUniqueLocationNames.Value\r\n    )\r\n);\r\n\r\n\r\n// --- [ส่วนที่ 3: คำนวณ Priority (Zone + Route)] ---\r\nClear(colItemsWithPrio);\r\nForAll(\r\n    colBaseItems As colItem, \r\n    With(\r\n        {\r\n            _location: LookUp(colLocationsData, crcfe_loc_name = colItem.crcfe_locationid),\r\n            \r\n            // [เพิ่มใหม่!] ค้นหา Route Priority จาก DestinationCode\r\n            // สมมติว่าใน SNP_... คอลัมน์ชื่อ DestinationCode\r\n            // และใน SharePoint คอลัมน์ชื่อ Title\r\n            _route: LookUp(colRouteRef, Title = colItem.DestinationCode) \r\n        },\r\n        \r\n        If(\r\n            _location.crcfe_loc_zone.TH_WH_Zone in colMyZoneLookups.Value,\r\n            With(\r\n                {\r\n                    _priority: LookUp(colMyPrio, crcfe_uzp_zone.TH_WH_Zone = _location.crcfe_loc_zone.TH_WH_Zone)\r\n                },\r\n                Collect(\r\n                    colItemsWithPrio,\r\n                    {\r\n                        DocumentNo: colItem.cr519_loadexportno, \r\n                        // Priority ตามเวลา: หลัง 16:00 บ่ายสำคัญสุด, ก่อน 16:00 เช้าสำคัญสุด\r\n                        CalculatedRoundPriority: If(\r\n                            varCurrentTimeVal > 16.0,\r\n                            If(colItem.crcfe_round = \"Afternoon\", 1, 2),\r\n                            If(colItem.crcfe_round = \"Morning\", 1, 2)\r\n                        ),\r\n                        CalculatedZonePriority: If(IsBlank(_priority), 99, _priority.uzp_priority),\r\n                        CalculatedRoutePriority: If(IsBlank(_route), 99, _route.routePriority), \r\n                        \r\n                        FullItemRecord: colItem\r\n                    }\r\n                )\r\n            )\r\n        )\r\n    )\r\n);\r\n\r\n// --- [ส่วนที่ 4: GroupBy และสร้าง Final List] ---\r\nClearCollect(colGroupedDocs, GroupBy(colItemsWithPrio, DocumentNo, _items));\r\n\r\nClear(colFinalLoadExportList);\r\nForAll(\r\n    colGroupedDocs,\r\n    Collect(\r\n        colFinalLoadExportList,\r\n        {\r\n            cr519_loadexportno: ThisRecord.DocumentNo, \r\n            // หา Round ของเอกสารนี้\r\n            DocRoundPriority: Min(ThisRecord._items, CalculatedRoundPriority),\r\n            \r\n            // หา Zone Priority (เลขน้อยสุด) ของเอกสารนี้\r\n            HighestZonePriority: Min(ThisRecord._items, CalculatedZonePriority),\r\n            \r\n            // หา Route Priority ของเอกสารนี้ (ปกติเลขเดียวกันทั้งใบ)\r\n            DocRoutePriority: Min(ThisRecord._items, CalculatedRoutePriority)\r\n        }\r\n    )\r\n);\r\n\r\n\r\n\r\n\r\nUpdateContext({ var_showLoader: false });\r\n)"
+            Width: =590
+            X: =27
+            Y: =278
+      - Label5_2:
+          Control: Label@2.5.1
+          Properties:
+            BorderColor: =RGBA(0, 18, 107, 1)
+            Color: =RGBA(39, 113, 194, 1)
+            Font: =Font.'Open Sans'
+            FontWeight: =FontWeight.Bold
+            Height: =36
+            Size: =18
+            Text: ="Scan Tag Number"
+            Width: =590
+            X: =27
+            Y: =241
+      - Icon2:
+          Control: Classic/Icon@2.5.0
+          Properties:
+            BorderColor: =RGBA(0, 18, 107, 1)
+            Color: =RGBA(255, 255, 255, 1)
+            Height: =60
+            Icon: =Icon.Cancel
+            OnSelect: =Exit()
+            Width: =52
+            X: =11
+            Y: =5
+      - Label1_2:
+          Control: Label@2.5.1
+          Properties:
+            Align: =Align.Center
+            BorderColor: =RGBA(0, 18, 107, 1)
+            BorderThickness: =1
+            Font: =Font.'Open Sans'
+            Height: =44
+            Size: =18
+            Text: =If(LookUp(SNP_LoadExportSalesOrders,LoadExportNo = LoadExportBox.Selected.cr519_loadexportno,round) = "Morning", "รอบเช้า",LookUp(SNP_LoadExportSalesOrders,LoadExportNo = LoadExportBox.Selected.cr519_loadexportno,round) ="Afternoon","รอบบ่าย")
+            Width: =324
+            X: =293
+            Y: =500
+      - Label1_3:
+          Control: Label@2.5.1
+          Properties:
+            Align: =Align.Center
+            BorderColor: =RGBA(0, 18, 107, 1)
+            BorderThickness: =1
+            Font: =Font.'Open Sans'
+            FontWeight: =FontWeight.Bold
+            Height: =44
+            Size: =18
+            Text: ="Customer Name:"
+            Width: =593
+            X: =24
+            Y: =634
+      - Timer1:
+          Control: Timer@2.1.0
+          Properties:
+            BorderColor: =ColorFade(Self.Fill, -15%)
+            Color: =RGBA(255, 255, 255, 1)
+            DisabledBorderColor: =ColorFade(Self.BorderColor, 70%)
+            DisabledColor: =ColorFade(Self.Fill, 90%)
+            DisabledFill: =ColorFade(Self.Fill, 70%)
+            Duration: =86400000
+            Fill: =RGBA(56, 96, 178, 1)
+            Font: =Font.'Open Sans'
+            HoverBorderColor: =ColorFade(Self.BorderColor, 20%)
+            HoverColor: =RGBA(255, 255, 255, 1)
+            HoverFill: =ColorFade(RGBA(56, 96, 178, 1), -20%)
+            PressedBorderColor: =Self.Fill
+            PressedColor: =Self.Fill
+            PressedFill: =Self.Color
+            Reset: =varResetTimer
+            Start: =varTimerRunning
+            Visible: =false
+            X: =124
+            Y: =903
+      - Container2_1:
+          Control: GroupContainer@1.3.0
+          Variant: ManualLayout
+          Properties:
+            BorderColor: =RGBA(0, 0, 0, 0)
+            DropShadow: =DropShadow.None
+            Height: =108
+            RadiusBottomLeft: =0
+            RadiusBottomRight: =0
+            RadiusTopLeft: =0
+            RadiusTopRight: =0
+            Width: =251
+            X: =208
+            Y: =146
+          Children:
+            - Spinner1_2:
+                Control: Spinner@1.4.6
+                Properties:
+                  Appearance: ='Spinner.Appearance'.Primary
+                  BasePaletteColor: =RGBA(168, 110, 235, 1)
+                  Height: =108
+                  Label: ="Loading"
+                  LabelPosition: ='Spinner.LabelPosition'.Below
+                  SpinnerSize: ='Spinner.SpinnerSize'.Huge
+                  Visible: =var_showLoader
+                  Width: =251
+      - Label14:
+          Control: Label@2.5.1
+          Properties:
+            Align: =Align.Center
+            BorderColor: =RGBA(0, 18, 107, 1)
+            Font: =Font.'Open Sans'
+            Text: =CountRows(colFinalLoadExportList) & " Load Export Numbers"
+            Width: =593
+            X: =27
+            Y: =942
+      - Label1_4:
+          Control: Label@2.5.1
+          Properties:
+            Align: =Align.Center
+            BorderColor: =RGBA(0, 18, 107, 1)
+            BorderThickness: =1
+            Font: =Font.'Open Sans'
+            FontWeight: =FontWeight.Bold
+            Height: =44
+            Size: =18
+            Text: |-
+              ="Delivery Date: " //& LookUp(SNP_LoadExportSalesOrders,LoadExportNo = LoadExportBox.Selected.cr519_loadexportno,SalesOrderNo)
+            Width: =269
+            X: =24
+            Y: =545
+      - Label1_5:
+          Control: Label@2.5.1
+          Properties:
+            Align: =Align.Center
+            BorderColor: =RGBA(0, 18, 107, 1)
+            BorderThickness: =1
+            Font: =Font.'Open Sans'
+            Height: =44
+            Size: =18
+            Text: =Text(LookUp(SNP_LoadExportSalesOrders,LoadExportNo = LoadExportBox.Selected.cr519_loadexportno,DeliveryDate),"dd/mm/yyyy")
+            Width: =324
+            X: =293
+            Y: =545
+      - Label1_6:
+          Control: Label@2.5.1
+          Properties:
+            Align: =Align.Center
+            BorderColor: =RGBA(0, 18, 107, 1)
+            BorderThickness: =1
+            Font: =Font.'Open Sans'
+            FontWeight: =FontWeight.Bold
+            Height: =44
+            Size: =18
+            Text: |-
+              ="Sales Order No: " //& LookUp(SNP_LoadExportSalesOrders,LoadExportNo = LoadExportBox.Selected.cr519_loadexportno,SalesOrderNo)
+            Width: =269
+            X: =24
+            Y: =590
+      - Label1_7:
+          Control: Label@2.5.1
+          Properties:
+            Align: =Align.Center
+            BorderColor: =RGBA(0, 18, 107, 1)
+            BorderThickness: =1
+            Font: =Font.'Open Sans'
+            Height: =44
+            Size: =18
+            Text: =LookUp(SNP_LoadExportSalesOrders,LoadExportNo = LoadExportBox.Selected.cr519_loadexportno,SalesOrderNo)
+            Width: =324
+            X: =293
+            Y: =590
+      - Label18:
+          Control: Label@2.5.1
+          Properties:
+            Align: =Align.Right
+            BorderColor: =RGBA(0, 18, 107, 1)
+            Color: =RGBA(202, 202, 202, 1)
+            Font: =Font.'Open Sans'
+            Height: =48
+            PaddingRight: =15
+            Text: =If(varActiveRound = "Morning", "รอบเช้า","รอบบ่าย")
+            Visible: =false
+            Width: =179
+            X: =461
+            Y: =146
+      - resumeBT:
+          Control: Classic/Button@2.2.0
+          Properties:
+            BorderColor: =ColorFade(Self.Fill, -15%)
+            Color: =RGBA(255, 255, 255, 1)
+            DisabledBorderColor: =RGBA(166, 166, 166, 1)
+            Fill: =RGBA(56, 96, 178, 1)
+            Font: =Font.'Open Sans'
+            Height: =52
+            HoverBorderColor: =ColorFade(Self.BorderColor, 20%)
+            HoverColor: =RGBA(255, 255, 255, 1)
+            HoverFill: =ColorFade(RGBA(56, 96, 178, 1), -20%)
+            OnSelect: |+
+              =Navigate('Submit Screen');
+            PressedBorderColor: =Self.Fill
+            PressedColor: =Self.Fill
+            PressedFill: =Self.Color
+            Visible: =false
+            Width: =240
+            X: =360
+            Y: =1012
